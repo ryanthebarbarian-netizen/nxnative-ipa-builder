@@ -132,10 +132,14 @@ jobs:
           )"
 
             echo "Downloading $(basename "$output")..."
+            # Download into a folder of its own so the file keeps its Google Drive name
+            # (nxnative reads [title ID][vVersion] from NSP names), then move it into place.
+            local dl_dir="${output}.d"
+            mkdir -p "$dl_dir"
             # Google Drive often drops large downloads part-way; resume until complete
             local attempt
             for attempt in 1 2 3 4 5 6 7 8; do
-              if gdown --continue "$file_id" -O "$output"; then
+              if gdown --continue "$file_id" -O "$dl_dir/"; then
                 break
               fi
               if [[ "$attempt" == 8 ]]; then
@@ -145,6 +149,21 @@ jobs:
               echo "::warning::Download interrupted (attempt $attempt); resuming in 20 s..."
               sleep 20
             done
+
+            local got=()
+            local f
+            for f in "$dl_dir"/*; do
+              [[ -f "$f" && "$f" != *.part ]] && got+=("$f")
+            done
+            if [[ ${#got[@]} -ne 1 ]]; then
+              echo "::error::Expected one downloaded file in $dl_dir, found ${#got[@]}."
+              ls -la "$dl_dir"
+              exit 1
+            fi
+            echo "Google Drive file name: $(basename "${got[0]}")"
+            basename "${got[0]}" > "${output}.name"
+            mv "${got[0]}" "$output"
+            rm -rf "$dl_dir"
 
             if [[ ! -s "$output" ]]; then
               echo "::error::Downloaded file is empty."
@@ -180,7 +199,9 @@ jobs:
           mkdir -p "$GAME_DIR"
 
           python - "$WORK" "$GAME_DIR" <<'PY'
+          import re
           import shutil
+          import struct
           import subprocess
           import sys
           from pathlib import Path
@@ -211,8 +232,51 @@ jobs:
                       f"Invalid {suffix} package signature: {path.name}"
                   )
 
+          TAGGED = re.compile(r"\[[0-9A-Fa-f]{16}\].*\[v\d+\]")
+
+          def cnmt_info(path):
+              """(title ID, version) from a plain-text .cnmt.xml inside an NSP, else None."""
+              try:
+                  with path.open("rb") as f:
+                      header = f.read(16)
+                      if header[:4] != b"PFS0":
+                          return None
+                      count, string_size = struct.unpack_from("<II", header, 4)
+                      if count > 100000 or string_size > 100000000:
+                          return None
+                      entries = f.read(count * 0x18)
+                      strings = f.read(string_size)
+                      data_start = 0x10 + count * 0x18 + string_size
+                      for i in range(count):
+                          off, size, name_off = struct.unpack_from("<QQI", entries, i * 0x18)
+                          name = strings[name_off:strings.find(b"\0", name_off)].decode(errors="replace")
+                          if name.lower().endswith(".cnmt.xml") and size < 1_000_000:
+                              f.seek(data_start + off)
+                              xml = f.read(size).decode(errors="replace")
+                              i_m = re.search(r"<Id>0x([0-9A-Fa-f]{16})</Id>", xml)
+                              v_m = re.search(r"<Version>(\d+)</Version>", xml)
+                              if i_m and v_m:
+                                  return i_m.group(1).upper(), int(v_m.group(1))
+              except (OSError, struct.error):
+                  pass
+              return None
+
+          def tagged_name(path, fallback_stem, extension):
+              """A file name nxnative can read: keep one that already has [titleID]...[vN],
+              else build one from the NSP's cnmt.xml, else keep what we have."""
+              if TAGGED.search(path.name) and path.suffix.lower() in package_extensions:
+                  return path.name
+              info = cnmt_info(path)
+              if info:
+                  return f"{fallback_stem} [{info[0]}][v{info[1]}]{extension}"
+              print(
+                  f"::warning::{path.name}: no [title ID][version] in its name and no cnmt.xml inside; "
+                  "nxnative will need the NSP's ticket to identify it."
+              )
+              return f"{fallback_stem}{extension}"
+
           def add_package(source, label):
-              target = game_dir / source.name
+              target = game_dir / tagged_name(source, source.stem, source.suffix.lower())
 
               if target.exists():
                   raise SystemExit(
@@ -292,7 +356,15 @@ jobs:
                           "Direct downloads must be NSP or XCI files."
                       )
 
-                  target = game_dir / f"{label}{extension}"
+                  name_file = work / f"{label}.download.name"
+                  original = Path(name_file.read_text().strip()) if name_file.exists() else Path(label)
+                  print(f"{label}: Google Drive name: {original.name}")
+                  stem = original.stem if original.suffix.lower() in package_extensions else original.name
+                  probe = source.with_name(original.stem + extension) if TAGGED.search(original.name) else source
+                  if probe is not source:
+                      source.rename(probe)
+                      source = probe
+                  target = game_dir / tagged_name(source, stem or label, extension)
 
                   if target.exists():
                       raise SystemExit(
@@ -330,6 +402,7 @@ jobs:
       - name: Detect game title ID and select shader profile
         env:
           PROFILE_OVERRIDE: ${{ inputs.profile_id }}
+          DEVICE: ${{ inputs.device }}
         shell: bash
         run: |
           set -euo pipefail
@@ -344,95 +417,84 @@ jobs:
           root = Path(sys.argv[1])
           extensions = {".nsp", ".xci", ".nsz", ".xcz"}
 
-          def pfs0_names(path):
+          def pfs0_entries(path):
+              """(name, absolute data offset, size) for each file in a PFS0 (NSP/NSZ)."""
               try:
                   with path.open("rb") as f:
                       header = f.read(16)
-
                       if len(header) != 16 or header[:4] != b"PFS0":
                           return []
-
-                      count, string_size = struct.unpack_from(
-                          "<II", header, 4
-                      )
-
+                      count, string_size = struct.unpack_from("<II", header, 4)
                       if count > 100000 or string_size > 100000000:
                           return []
-
                       entries = f.read(count * 0x18)
                       strings = f.read(string_size)
-
                       if len(entries) != count * 0x18:
                           return []
-
-                      names = []
-
+                      data_start = 0x10 + count * 0x18 + string_size
+                      out = []
                       for i in range(count):
-                          offset = struct.unpack_from(
-                              "<I", entries, i * 0x18 + 0x10
-                          )[0]
-
-                          if offset >= len(strings):
+                          data_off, data_size, name_off = struct.unpack_from("<QQI", entries, i * 0x18)
+                          if name_off >= len(strings):
                               continue
-
-                          end = strings.find(b"\0", offset)
-
+                          end = strings.find(b"\0", name_off)
                           if end < 0:
                               continue
-
-                          names.append(
-                              strings[offset:end].decode(
-                                  errors="replace"
-                              )
-                          )
-
-                      return names
-
+                          out.append((strings[name_off:end].decode(errors="replace"), data_start + data_off, data_size))
+                      return out
               except (OSError, struct.error):
                   return []
 
+          def add(candidates, hex_id):
+              title_id = int(hex_id, 16)
+              if (title_id & 0xFFF) == 0:   # base game IDs end in 000 (updates 800, DLC others)
+                  candidates.add(f"{title_id:016X}")
+
           candidates = set()
 
-          for path in root.iterdir():
+          for path in sorted(root.iterdir()):
               if not path.is_file() or path.suffix.lower() not in extensions:
                   continue
+              entries = pfs0_entries(path)
+              print(f"{path.name}: {[e[0] for e in entries]}", file=sys.stderr)
 
-              for name in pfs0_names(path):
-                  match = re.fullmatch(
-                      r"([0-9A-Fa-f]{16})[0-9A-Fa-f]{16}\.tik",
-                      name,
-                  )
+              for name, data_pos, data_size in entries:
+                  # 1. ticket: <title ID><key generation>.tik
+                  m = re.fullmatch(r"([0-9A-Fa-f]{16})[0-9A-Fa-f]{16}\.tik", name)
+                  if m:
+                      add(candidates, m.group(1))
+                  # 2. plain-text metadata many NSPs carry: <hash>.cnmt.xml with <Id>0x...</Id>
+                  if name.lower().endswith(".cnmt.xml") and data_size < 1_000_000:
+                      with path.open("rb") as f:
+                          f.seek(data_pos)
+                          xml = f.read(data_size).decode(errors="replace")
+                      for m in re.finditer(r"<Id>0x([0-9A-Fa-f]{16})</Id>", xml):
+                          add(candidates, m.group(1))
 
-                  if match:
-                      title_id = int(match.group(1), 16)
+              # 3. [titleID] in the file name
+              m = re.search(r"\[([0-9A-Fa-f]{16})\]", path.name)
+              if m:
+                  add(candidates, m.group(1))
 
-                      if (title_id & 0xFFF) == 0:
-                          candidates.add(f"{title_id:016X}")
-
-              match = re.search(
-                  r"\[([0-9A-Fa-f]{16})\]",
-                  path.name,
-              )
-
-              if match:
-                  title_id = int(match.group(1), 16)
-
-                  if (title_id & 0xFFF) == 0:
-                      candidates.add(f"{title_id:016X}")
-
-          if len(candidates) != 1:
-              raise SystemExit(
-                  "Could not uniquely identify the base game's title ID. "
-                  f"Candidates found: {sorted(candidates)}. "
-                  "Check the base NSP and its ticket/filename."
-              )
-
-          print(next(iter(candidates)))
+          if len(candidates) == 1:
+              print(next(iter(candidates)))
+          else:
+              print(f"Title ID not found in tickets, cnmt.xml or file names. Candidates: {sorted(candidates)}", file=sys.stderr)
           PY
-          )"
+          )" || DETECTED_ID=""
 
           PROFILE_ID="${PROFILE_OVERRIDE:-$DETECTED_ID}"
-          PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
+          PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+
+          if [[ -z "$PROFILE_ID" ]]; then
+            if [[ "$DEVICE" == "iPhone 15 or older (BC fallback)" ]]; then
+              echo "::error::Title ID not detected. Re-run and type the base game's title ID in the profile ID box (Metroid Dread: 010093801237C000)."
+              exit 1
+            fi
+            # The standard build reads the title ID itself with prod.keys; this ID only feeds the BC-fallback shader step.
+            echo "::warning::Title ID not detected from the files; the nxnative build script will detect it itself."
+            exit 0
+          fi
 
           if [[ ! "$PROFILE_ID" =~ ^[0-9A-F]{16}$ ]]; then
             echo "::error::Profile ID must be exactly 16 hexadecimal characters."
