@@ -29,25 +29,25 @@ jobs:
     steps:
       - name: Checkout BC fallback version
         if: inputs.device == 'iPhone 15 or older (BC fallback)'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mianmuhammadse/nxnative
           ref: no-bc   # maintained no-BC branch (newer than the old d158df6 snapshot: ASTC textures, Metroid Dread movie fixes)
 
       - name: Checkout standard nxnative version
         if: inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: seedds/nxnative
           ref: main
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
       - name: Set up .NET SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "10.0.x"
 
@@ -132,7 +132,19 @@ jobs:
           )"
 
             echo "Downloading $(basename "$output")..."
-            gdown "$file_id" -O "$output"
+            # Google Drive often drops large downloads part-way; resume until complete
+            local attempt
+            for attempt in 1 2 3 4 5 6 7 8; do
+              if gdown --continue "$file_id" -O "$output"; then
+                break
+              fi
+              if [[ "$attempt" == 8 ]]; then
+                echo "::error::Download of $(basename "$output") still incomplete after $attempt attempts."
+                exit 1
+              fi
+              echo "::warning::Download interrupted (attempt $attempt); resuming in 20 s..."
+              sleep 20
+            done
 
             if [[ ! -s "$output" ]]; then
               echo "::error::Downloaded file is empty."
@@ -493,7 +505,7 @@ jobs:
 
       - name: Upload IPA
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: NxNative-IPA-${{ inputs.device == 'iPhone 15 or older (BC fallback)' && 'BC-Fallback' || 'Standard' }}
           path: ${{ runner.temp }}/NxNative.ipa
@@ -502,7 +514,7 @@ jobs:
 
       - name: Upload build logs if available
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: NxNative-Build-Logs
           path: |
