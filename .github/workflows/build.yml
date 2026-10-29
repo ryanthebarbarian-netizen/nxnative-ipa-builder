@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: xcode-27   # macOS 27 image with Xcode 27.1 (the version nxnative tests with) as default
     timeout-minutes: 360
 
     steps:
@@ -67,7 +67,7 @@ jobs:
           ls -d /Applications/Xcode*.app || true
           # nxnative's shaders were tested with Xcode 27.1: use it if this runner image has it
           for x in /Applications/Xcode_27.1*.app; do
-            if [[ -d "$x" ]]; then sudo xcode-select -s "$x"; break; fi
+            if [[ -d "$x" && "$x" != *Candidate* ]]; then sudo xcode-select -s "$x"; break; fi
           done
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version || sudo xcodebuild -downloadPlatform iOS
