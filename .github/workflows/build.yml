@@ -1,4 +1,3 @@
-
 name: NxNative - Generic IPA Builder
 
 on:
@@ -183,7 +182,12 @@ jobs:
           fi
 
           if [[ -n "${DLC_URL:-}" ]]; then
-            download_file "$DLC_URL" "$WORK/dlc.download"
+            # DLC_URL may hold several links, separated by spaces, commas or new lines
+            dlc_n=0
+            for dlc_url in $(echo "$DLC_URL" | tr ',' ' '); do
+              dlc_n=$((dlc_n + 1))
+              download_file "$dlc_url" "$WORK/dlc$dlc_n.download"
+            done
           else
             echo "No DLC_URL configured; continuing without DLC."
           fi
@@ -381,7 +385,8 @@ jobs:
 
           process_download("game")
           process_download("update")
-          process_download("dlc")
+          for dlc in sorted(work.glob("dlc*.download"), key=lambda p: int(p.stem[3:] or 0)):
+              process_download(dlc.stem)
 
           packages = sorted(
               p for p in game_dir.iterdir()
