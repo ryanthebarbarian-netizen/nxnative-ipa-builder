@@ -11,6 +11,14 @@ on:
         options:
           - "iPhone 15 or older (BC fallback)"
           - "iPhone 15 Pro/Pro Max or newer (standard)"
+      game_data:
+        description: "Game data: bundle it in the IPA, or keep it out as a separate RomFS.img (for signers that crash on huge IPAs)"
+        required: true
+        type: choice
+        default: "Bundled in the IPA"
+        options:
+          - "Bundled in the IPA"
+          - "Separate (small IPA + RomFS.img download)"
       profile_id:
         description: "Optional nxnative profile ID override (leave blank for automatic detection)"
         required: false
@@ -26,6 +34,13 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Check run options
+        if: inputs.game_data == 'Separate (small IPA + RomFS.img download)' && inputs.device == 'iPhone 15 or older (BC fallback)'
+        shell: bash
+        run: |
+          echo "::error::Separate game data (--romfs separate) is only in the standard nxnative version; the BC fallback (no-bc) branch does not have it yet. Choose 'Bundled in the IPA' for the BC fallback."
+          exit 1
+
       - name: Checkout BC fallback version
         if: inputs.device == 'iPhone 15 or older (BC fallback)'
         uses: actions/checkout@v5
@@ -533,13 +548,22 @@ jobs:
       - name: Build unsigned IPA
         env:
           DEVICE: ${{ inputs.device }}
+          GAME_DATA: ${{ inputs.game_data }}
         shell: bash
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/nxnative"
           GAME_DIR="$RUNNER_TEMP/GameFiles"
           OUTPUT="$RUNNER_TEMP/NxNative.ipa"
+          BUILD_OUT="$RUNNER_TEMP/build_output.txt"
           EXTRA=()
+
+          SEPARATE=0
+          if [[ "$GAME_DATA" == "Separate (small IPA + RomFS.img download)" ]]; then
+            SEPARATE=1
+            # The game files stay out of the IPA; the app reads them from Documents/RomFS.img
+            EXTRA+=(--romfs separate --keep-extracted)
+          fi
 
           # Standard (main) builds stop when the runner's Metal compiler is not the one in the lock
           # file. Main has no dmsh_chain.py --update-lock; its supported switch is --allow-other-metal.
@@ -560,7 +584,7 @@ jobs:
             -k "$WORK/prod.keys" \
             -o "$OUTPUT" \
             --progress lines \
-            ${EXTRA[@]+"${EXTRA[@]}"}
+            ${EXTRA[@]+"${EXTRA[@]}"} 2>&1 | tee "$BUILD_OUT"
 
           if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
@@ -570,12 +594,38 @@ jobs:
           echo "IPA successfully created: $OUTPUT"
           ls -lh "$OUTPUT"
 
+          if [[ "$SEPARATE" == 1 ]]; then
+            # The script ends with: scripts/push_romfs.sh <device UDID> <bundle ID> "<.../RomFS.img>"
+            IMAGE="$(grep -o 'push_romfs.sh .*"[^"]*RomFS.img"' "$BUILD_OUT" | tail -1 | sed 's/.*"\([^"]*\)"$/\1/' || true)"
+            if [[ -z "$IMAGE" || ! -f "$IMAGE" ]]; then
+              # Fall back to the newest extracted image
+              IMAGE="$(ls -t "$GAME_DIR"/*_build/extract/*/RomFS.img 2>/dev/null | head -1 || true)"
+            fi
+            if [[ -z "$IMAGE" || ! -f "$IMAGE" ]]; then
+              echo "::error::Separate game data was chosen, but no RomFS.img was found."
+              grep -n -i 'romfs' "$BUILD_OUT" | tail -20 || true
+              exit 1
+            fi
+            echo "Game data image: $IMAGE"
+            mv "$IMAGE" "$RUNNER_TEMP/RomFS.img"
+            ls -lh "$RUNNER_TEMP/RomFS.img"
+          fi
+
       - name: Upload IPA
         if: success()
         uses: actions/upload-artifact@v5
         with:
           name: NxNative-IPA-${{ inputs.device == 'iPhone 15 or older (BC fallback)' && 'BC-Fallback' || 'Standard' }}
           path: ${{ runner.temp }}/NxNative.ipa
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload separate game data (RomFS.img)
+        if: success() && inputs.game_data == 'Separate (small IPA + RomFS.img download)'
+        uses: actions/upload-artifact@v5
+        with:
+          name: NxNative-RomFS
+          path: ${{ runner.temp }}/RomFS.img
           if-no-files-found: error
           retention-days: 1
 
@@ -596,4 +646,5 @@ jobs:
         run: |
           rm -rf \
             "$RUNNER_TEMP/nxnative" \
-            "$RUNNER_TEMP/GameFiles"
+            "$RUNNER_TEMP/GameFiles" \
+            "$RUNNER_TEMP/RomFS.img"
